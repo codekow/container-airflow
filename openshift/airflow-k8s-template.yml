@@ -1,0 +1,510 @@
+apiVersion: v1
+kind: Template
+metadata:
+  name: airflow-k8s
+  annotations:
+    iconClass: "icon-openshift"
+    description: "Airflow (Openshift)"
+    tags: "airflow,python"
+labels:
+  template: "airflow-k8s"
+message: |
+  Clean Up (all) Command:
+    oc delete all,secrets,cm,sa,role,rolebinding,pvc -l template=airflow-k8s
+parameters:
+- name: APPLICATION_NAME
+  displayName: Application Name
+  value: airflow
+  required: true
+- name: WORKER_MEM_LIMIT
+  displayName: Build Memory Limit
+  value: 2Gi
+  description: Consider the Pod Quota Limits on Your namespace
+- name: WORKER_CPU_LIMIT
+  displayName: Build CPU Limit
+  value: "1"
+  description: Consider the Pod Quota Limits on Your namespace
+- name: BUILD_DEPLOY_TOKEN_USERNAME
+  description: "Username to allow cloning of private repos"
+  displayName: "GIT Username"
+- name: BUILD_DEPLOY_TOKEN_PASSWORD
+  description: "Username to allow cloning of private repos"
+  displayName: "GIT Password"
+- name: BUILD_REF
+  description: "Branch Name to build from (default: master)"
+  value: master
+- name: BUILD_URL
+  description: "URL to git repo - https://github.com/codekow/container-airflow.git"
+  value: "https://github.com/codekow/container-airflow.git"
+- description: Username for PostgreSQL
+  displayName: PostgreSQL Username
+  from: 'user[A-Z0-9]{5}'
+  generate: expression
+  name: POSTGRESQL_USER
+  required: true
+- description: Password for PostgreSQL
+  displayName: PostgreSQL Password
+  from: '[a-zA-Z0-9]{32}'
+  generate: expression
+  name: POSTGRESQL_PASSWORD
+  required: true
+- description: Database Name for PostgreSQL
+  displayName: PostgreSQL Database Name
+  from: 'airflow[A-Z0-9]{5}'
+  generate: expression
+  name: POSTGRESQL_DATABASE
+  required: true
+objects:
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: ${APPLICATION_NAME}-sa
+- apiVersion: authorization.openshift.io/v1
+  kind: Role
+  metadata:
+    name: pod-creator
+  rules:
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    - pods/exec
+    verbs:
+    - create
+    - delete
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - ""
+    resources:
+    - pods/log
+    verbs:
+    - get
+- apiVersion: authorization.openshift.io/v1
+  kind: RoleBinding
+  metadata:
+    name: ${APPLICATION_NAME}
+  roleRef:
+    kind: Role
+    name: edit
+  subjects:
+  - kind: ServiceAccount
+    name: ${APPLICATION_NAME}-sa
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ${APPLICATION_NAME}
+  data:
+    workpod.yml: |
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        annotations:
+        labels:
+          chuck: "norris"
+          template: "airflow-k8s"
+        name: airflow-worker
+      spec:
+        restartPolicy: Never
+        containers:
+          - command: entrypoint.sh
+            env:
+              - name: PATH
+                value: "/usr/local/bin:/bin"
+              - name: AIRFLOW__CORE__EXECUTOR
+                value: LocalExecutor
+              - name: AIRFLOW__CORE__SQL_ALCHEMY_CONN
+                valueFrom:
+                  secretKeyRef:
+                    key: database-uri
+                    name: ${APPLICATION_NAME}-db
+            image: "${APPLICATION_NAME}:latest"
+            imagePullPolicy: Always
+            name: base
+            resources:
+              limits:
+                cpu: "${WORKER_CPU_LIMIT}"
+                memory: "${WORKER_MEM_LIMIT}"
+              requests:
+                cpu: 100m
+                memory: 256Mi
+            volumeMounts:
+              - mountPath: /opt/app-root/src
+                name: airflow-vol
+        serviceAccount: default
+        serviceAccountName: default
+        volumes:
+          - name: airflow-vol
+            persistentVolumeClaim:
+              claimName: ${APPLICATION_NAME}-pvc
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+  spec:
+    output:
+      to:
+        kind: ImageStreamTag
+        name: ${APPLICATION_NAME}:latest
+    runPolicy: Serial
+    source:
+      contextDir: /container
+      git:
+        httpProxy: ''
+        httpsProxy: ''
+        noProxy: localhost,localdomain.com,cluster.local,svc,$(KUBERNETES_SERVICE_HOST)
+        ref: ${BUILD_REF}
+        uri: ${BUILD_URL}
+      sourceSecret:
+        name: gitserver-verify
+      type: Git
+    strategy:
+      dockerStrategy:
+        from:
+          kind: ImageStreamTag
+          name: 'python:latest'
+    triggers:
+      - type: ConfigChange
+      - imageChange: {}
+        type: ImageChange
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    annotations:
+      template.alpha.openshift.io/wait-for-ready: "true"
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-db
+  spec:
+    replicas: 1
+    selector:
+      app: ${APPLICATION_NAME}
+      deploymentconfig: ${APPLICATION_NAME}-db
+    strategy:
+      type: Recreate
+    template:
+      metadata:
+        labels:
+          app: ${APPLICATION_NAME}
+          deploymentconfig: ${APPLICATION_NAME}-db
+      spec:
+        containers:
+        - env:
+          - name: POSTGRESQL_USER
+            valueFrom:
+              secretKeyRef:
+                key: database-user
+                name: ${APPLICATION_NAME}-db
+          - name: POSTGRESQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: database-password
+                name: ${APPLICATION_NAME}-db
+          - name: POSTGRESQL_DATABASE
+            valueFrom:
+              secretKeyRef:
+                key: database-name
+                name: ${APPLICATION_NAME}-db
+          image: postgresql:10
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 5432
+            timeoutSeconds: 1
+          name: postgresql
+          ports:
+          - containerPort: 5432
+            protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -i
+              - -c
+              - psql -h 127.0.0.1 -U $POSTGRESQL_USER -q -d $POSTGRESQL_DATABASE -c
+                'SELECT 1'
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            limits:
+              memory: 512Mi
+          volumeMounts:
+          - mountPath: /var/lib/pgsql/data
+            name: postgresql-data
+        restartPolicy: Always
+        volumes:
+        - name: postgresql-data
+          persistentVolumeClaim:
+            claimName: ${APPLICATION_NAME}-db
+        - name: empty
+          emptyDir: {}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+          - postgresql
+        from:
+          kind: ImageStreamTag
+          name: postgresql:10
+          namespace: openshift
+      type: ImageChange
+    - type: ConfigChange
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    annotations:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-web
+  spec:
+    replicas: 1
+    selector:
+      app: ${APPLICATION_NAME}
+      deploymentconfig: ${APPLICATION_NAME}-web
+    strategy:
+      type: Rolling
+    template:
+      metadata:
+        annotations:
+        labels:
+          app: ${APPLICATION_NAME}
+          deploymentconfig: ${APPLICATION_NAME}-web
+      spec:
+        containers:
+        - name: webserver
+          env:
+          - name: EXECUTOR
+            value: Kubernetes
+          - name: AIRFLOW__WEBSERVER__WORKERS
+            value: '2'
+          - name: AIRFLOW__CORE__PARALLELISM
+            value: '64'
+          - name: AIRFLOW__CORE__DAG_CONCURRENCY
+            value: '32'
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: "metadata.namespace"
+          - name: AIRFLOW__KUBERNETES__NAMESPACE
+            value: $(NAMESPACE)
+          - name: AIRFLOW__KUBERNETES__DAGS_IN_IMAGE
+            value: 'true'
+          - name: AIRFLOW__CORE__SQL_ALCHEMY_CONN
+            valueFrom:
+              secretKeyRef:
+                key: database-uri
+                name: ${APPLICATION_NAME}-db
+          image: ${APPLICATION_NAME}
+          args:
+            - webserver
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          volumeMounts:
+          - mountPath: /config
+            name: ${APPLICATION_NAME}-cfg
+          - mountPath: "/opt/app-root/src"
+            name: ${APPLICATION_NAME}-vol
+          resources:
+            requests:
+              cpu: "300m"
+              memory: 256M
+            limits:
+              cpu: "600m"
+              memory: "750M"
+        - name: scheduler
+          env:
+          - name: EXECUTOR
+            value: Kubernetes
+          - name: AIRFLOW__CORE__PARALLELISM
+            value: '64'
+          - name: AIRFLOW__CORE__DAG_CONCURRENCY
+            value: '32'
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: "metadata.namespace"
+          - name: AIRFLOW__KUBERNETES__NAMESPACE
+            value: $(NAMESPACE)
+          - name: AIRFLOW__KUBERNETES__POD_TEMPLATE_FILE
+            value: /config/workpod.yml
+          - name: AIRFLOW__KUBERNETES__WORKER_CONTAINER_REPOSITORY
+            value: docker-registry.default.svc:5000/$(AIRFLOW__KUBERNETES__NAMESPACE)/${APPLICATION_NAME}
+          - name: AIRFLOW__KUBERNETES__WORKER_CONTAINER_TAG
+            value: latest
+          - name: AIRFLOW__KUBERNETES__DELETE_WORKER_PODS
+            value: 'true'
+          - name: AIRFLOW__CORE__SQL_ALCHEMY_CONN
+            valueFrom:
+              secretKeyRef:
+                key: database-uri
+                name: ${APPLICATION_NAME}-db
+          image: ${APPLICATION_NAME}
+          args:
+            - scheduler
+          imagePullPolicy: IfNotPresent
+          ports:
+          - containerPort: 8793
+            protocol: TCP
+          volumeMounts:
+          - mountPath: /config
+            name: ${APPLICATION_NAME}-cfg
+          - mountPath: "/opt/app-root/src"
+            name: ${APPLICATION_NAME}-vol
+          resources:
+              requests:
+                cpu: "300m"
+                memory: 128M
+              limits:
+                cpu: "500m"
+                memory: 256M
+        restartPolicy: Always
+        serviceAccount: ${APPLICATION_NAME}-sa
+        serviceAccountName: ${APPLICATION_NAME}-sa
+        volumes:
+        - configMap:
+            defaultMode: 420
+            name: ${APPLICATION_NAME}
+          name: ${APPLICATION_NAME}-cfg
+        - name: ${APPLICATION_NAME}-vol
+          persistentVolumeClaim:
+            claimName: ${APPLICATION_NAME}-pvc
+        - name: empty
+          emptyDir: {}
+    triggers:
+    - type: ConfigChange
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+          - webserver
+          - scheduler
+        from:
+          kind: ImageStreamTag
+          name: ${APPLICATION_NAME}:latest
+      type: ImageChange
+- apiVersion: v1
+  stringData:
+    database-name: ${POSTGRESQL_DATABASE}
+    database-password: ${POSTGRESQL_PASSWORD}
+    database-user: ${POSTGRESQL_USER}
+    database-uri: "postgresql+psycopg2://${POSTGRESQL_USER}:${POSTGRESQL_PASSWORD}@${APPLICATION_NAME}-db:5432/${POSTGRESQL_DATABASE}"
+  kind: Secret
+  metadata:
+    annotations:
+      template.openshift.io/expose-database_name: '{.data[''database-name'']}'
+      template.openshift.io/expose-password: '{.data[''database-password'']}'
+      template.openshift.io/expose-username: '{.data[''database-user'']}'
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-db
+  type: Opaque
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      template.openshift.io/expose-uri: postgres://{.spec.clusterIP}:{.spec.ports[?(.name=="postgresql")].port}
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-db
+  spec:
+    ports:
+    - name: postgresql
+      port: 5432
+      protocol: TCP
+      targetPort: 5432
+    selector:
+      app: ${APPLICATION_NAME}
+      deploymentconfig: ${APPLICATION_NAME}-db
+    sessionAffinity: None
+    type: ClusterIP
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-web
+  spec:
+    ports:
+    - name: 8080-tcp
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+    selector:
+      app: ${APPLICATION_NAME}
+      deploymentconfig: ${APPLICATION_NAME}-web
+    sessionAffinity: None
+    type: ClusterIP
+- kind: ImageStream
+  apiVersion: v1
+  metadata:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+  spec:
+    lookupPolicy:
+      local: false
+- apiVersion: v1
+  kind: Route
+  metadata:
+    annotations:
+      openshift.io/host.generated: "true"
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+  spec:
+    port:
+      targetPort: 8080-tcp
+    tls:
+      insecureEdgeTerminationPolicy: Redirect
+      termination: edge
+    to:
+      kind: Service
+      name: ${APPLICATION_NAME}-web
+      weight: 100
+    wildcardPolicy: None
+- apiVersion: "v1"
+  kind: "PersistentVolumeClaim"
+  metadata:
+    name: ${APPLICATION_NAME}-pvc
+    labels:
+      app: ${APPLICATION_NAME}
+  spec:
+    accessModes:
+      - "ReadWriteMany"
+    resources:
+      requests:
+        storage: "3Gi"
+- apiVersion: "v1"
+  kind: "PersistentVolumeClaim"
+  metadata:
+    name: ${APPLICATION_NAME}-db
+    labels:
+      app: ${APPLICATION_NAME}
+  spec:
+    accessModes:
+      - "ReadWriteOnce"
+    resources:
+      requests:
+        storage: "2Gi"
