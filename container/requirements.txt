@@ -12,3 +12,5 @@ pytz
 redis==3.5.3
 SQLAlchemy==1.3.*
 virtualenv==20.*
+marshmallow==2.21.0
+WTForms==2.3.3

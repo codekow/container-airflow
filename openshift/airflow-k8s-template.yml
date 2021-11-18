@@ -208,7 +208,7 @@ objects:
               secretKeyRef:
                 key: database-name
                 name: ${APPLICATION_NAME}-db
-          image: postgresql:10
+          image: postgresql:12
           imagePullPolicy: IfNotPresent
           livenessProbe:
             failureThreshold: 3
