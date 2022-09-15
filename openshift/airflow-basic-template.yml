@@ -1,0 +1,174 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: airflow-basic
+  annotations:
+    iconClass: "icon-openshift"
+    description: "Airflow (Openshift)"
+    tags: "airflow,python"
+labels:
+  template: "airflow-basic"
+message: |
+  Clean Up (all) Command:
+    oc delete all -l template=airflow-basic
+parameters:
+- name: APPLICATION_NAME
+  displayName: Application Name
+  value: airflow-basic
+  required: true
+- name: WORKER_MEM_LIMIT
+  displayName: Build Memory Limit
+  value: 1Gi
+  description: Consider the Pod Quota Limits on Your namespace
+- name: WORKER_CPU_LIMIT
+  displayName: Build CPU Limit
+  value: '1'
+  description: Consider the Pod Quota Limits on Your namespace
+- name: BUILD_DEPLOY_TOKEN_USERNAME
+  description: "Username to allow cloning of private repos"
+  displayName: "GIT Username"
+- name: BUILD_DEPLOY_TOKEN_PASSWORD
+  description: "Username to allow cloning of private repos"
+  displayName: "GIT Password"
+- name: BUILD_REF
+  description: "Branch Name to build from (default: master)"
+  value: master
+- name: BUILD_URL
+  description: "URL to git repo - https://github.com/codekow/container-airflow.git"
+  value: "https://github.com/codekow/container-airflow.git"
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+  spec:
+    output:
+      to:
+        kind: ImageStreamTag
+        name: ${APPLICATION_NAME}:latest
+    runPolicy: Serial
+    source:
+      contextDir: /container
+      git:
+        httpProxy: ''
+        httpsProxy: ''
+        noProxy: localhost,localdomain.com,cluster.local,svc,$(KUBERNETES_SERVICE_HOST)
+        ref: ${BUILD_REF}
+        uri: ${BUILD_URL}
+      type: Git
+    strategy:
+      dockerStrategy:
+        from:
+          kind: ImageStreamTag
+          name: 'python:3.8'
+          namespace: openshift
+    triggers:
+      - type: ConfigChange
+      - imageChange: {}
+        type: ImageChange
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    annotations:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-web
+  spec:
+    replicas: 1
+    selector:
+      app: ${APPLICATION_NAME}
+      deploymentconfig: ${APPLICATION_NAME}-web
+    strategy:
+      type: Rolling
+    template:
+      metadata:
+        annotations:
+        labels:
+          app: ${APPLICATION_NAME}
+          deploymentconfig: ${APPLICATION_NAME}-web
+      spec:
+        containers:
+        - name: webserver
+          image: ${APPLICATION_NAME}
+          args:
+            - webserver
+          env:
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          volumeMounts:
+          - mountPath: "/opt/app-root/src"
+            name: ${APPLICATION_NAME}-vol
+          - mountPath: "/opt/app-root/src/dags"
+            name: ${APPLICATION_NAME}-dags
+          resources:
+            requests:
+              cpu: "300m"
+              memory: 256M
+            limits:
+              cpu: "${WORKER_CPU_LIMIT}"
+              memory: "${WORKER_MEM_LIMIT}"
+        volumes:
+        - name: ${APPLICATION_NAME}-vol
+          emptyDir: {}
+        - name: ${APPLICATION_NAME}-dags
+          emptyDir: {}
+    triggers:
+    - type: ConfigChange
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+          - webserver
+        from:
+          kind: ImageStreamTag
+          name: ${APPLICATION_NAME}:latest
+      type: ImageChange
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}-web
+  spec:
+    ports:
+    - name: 8080-tcp
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+    selector:
+      app: ${APPLICATION_NAME}
+      deploymentconfig: ${APPLICATION_NAME}-web
+    sessionAffinity: None
+    type: ClusterIP
+- kind: ImageStream
+  apiVersion: v1
+  metadata:
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+  spec:
+    lookupPolicy:
+      local: false
+- apiVersion: v1
+  kind: Route
+  metadata:
+    annotations:
+      openshift.io/host.generated: "true"
+    labels:
+      app: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME}
+  spec:
+    port:
+      targetPort: 8080-tcp
+    tls:
+      insecureEdgeTerminationPolicy: Redirect
+      termination: edge
+    to:
+      kind: Service
+      name: ${APPLICATION_NAME}-web
+      weight: 100
+    wildcardPolicy: None
