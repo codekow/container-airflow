@@ -1,7 +1,7 @@
 apache-airflow[crypto,celery,postgres,ssh,kubernetes]==1.*
 cattrs==1.1.*; python_version > "3.6"
 cattrs==1.0.*; python_version <= "3.6"
-celery==4.4.2
+celery==5.2.2
 cryptography==3.4.6
 ndg-httpsclient
 numpy==1.*
